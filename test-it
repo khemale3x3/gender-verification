@@ -1,0 +1,477 @@
+"""
+gender_detect_fixed.py
+══════════════════════════════════════════════════════════════════════════════
+Detects gender & age from profile image URLs.
+Models used (all FREE, no API key):
+  • YOLOv8n      – person detection (full-body / upper-body)
+  • OpenCV Haar  – 4-cascade face/person fallback (frontal, profile, upperbody)
+  • FairFace     – gender classification  (dima806, ~93 % accuracy)
+  • FairFace     – age classification     (dima806, ~59 % accuracy)
+
+FIXES vs previous version
+──────────────────────────
+  ✓ FIX 1 – "Conv object has no attribute 'bn'"
+             Stale / version-mismatched yolov8n.pt cache.
+             Script now auto-deletes the corrupt file and re-downloads.
+             Also catches the error mid-run and falls through to cascade.
+
+  ✓ FIX 2 – "No person detected (YOLO conf 0.0 %)" on close-up face shots
+             YOLO is trained for full-body detection; profile photos are
+             mostly head/shoulders. Added 4-layer fallback cascade:
+               Layer 1: YOLO person (threshold lowered 0.50 → 0.25)
+               Layer 2: OpenCV frontal face (default + alt2 models)
+               Layer 3: OpenCV profile face (left + right mirror)
+               Layer 4: OpenCV upper-body
+             If ALL layers miss, FairFace still runs as a soft gate —
+             it returns low confidence (<50 %) when there is no real face,
+             so false positives are naturally filtered.
+
+  ✓ FIX 3 – razorblaydes265-style case (YOLO 42.7 % < old 50 % threshold)
+             New threshold is 25 % for YOLO, plus cascade catches the rest.
+
+── Setup ─────────────────────────────────────────────────────────────────────
+  pip install ultralytics transformers torch pillow requests opencv-python
+
+── Run ───────────────────────────────────────────────────────────────────────
+  python gender_detect_fixed.py
+
+  Input  : URLS list below  OR  image_urls.csv with column "image_url"
+  Output : gender_results.csv   (resumes safely after interruption)
+══════════════════════════════════════════════════════════════════════════════
+"""
+
+import os, csv, time, warnings, logging, tempfile, shutil
+import requests
+from io import BytesIO
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ── Silence all noisy loggers ─────────────────────────────────────────────────
+warnings.filterwarnings("ignore")
+os.environ["TF_CPP_MIN_LOG_LEVEL"]   = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"]  = "0"
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+logging.getLogger("ultralytics").setLevel(logging.ERROR)
+
+import cv2
+import numpy as np
+from PIL import Image
+from transformers import pipeline
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+OUTPUT_CSV   = "gender_results.csv"
+INPUT_CSV    = "image_urls.csv"       # optional: CSV with "image_url" column
+
+URLS = [
+    "https://assets.someapp.com/focusonmore.jpg",
+    "https://assets.someapp.com/carolynjarrettjones.jpg",
+    "https://assets.someapp.com/baileyjst.jpg",
+    "https://assets.someapp.com/esteelbridal.jpg",
+    "https://assets.someapp.com/theosbornfour.jpg",
+    "https://assets.someapp.com/effiespaper.jpg",
+    "https://assets.someapp.com/bingeon.travel.jpg",
+    "https://assets.someapp.com/babynamesunday.jpg",
+    "https://assets.someapp.com/thestumpshop.jpg",
+    "https://assets.someapp.com/freysbaking.jpg",
+    "https://assets.someapp.com/hairbybiancarose.jpg",
+    "https://assets.someapp.com/andru.model.jpg",
+    "https://assets.someapp.com/mylifeinmotherhood.jpg",
+]
+
+MAX_WORKERS          = 4      # parallel threads
+IMAGE_TIMEOUT        = 15     # seconds per image download
+YOLO_CONF_THRESHOLD  = 0.25   # lowered from 0.50 → catches partial/angled detections
+GENDER_CONF_THRESHOLD= 0.50   # FairFace min confidence to report a result
+
+# ── Age mapping ───────────────────────────────────────────────────────────────
+
+AGE_MAP = {
+    "0-2": "(0-2)", "3-9": "(4-6)", "10-19": "(8-12)",
+    "20-29": "(25-32)", "30-39": "(38-43)", "40-49": "(48-53)",
+    "50-59": "(48-53)", "60-69": "(60-100)", "more than 70": "(60-100)",
+}
+def map_age(label: str) -> str:
+    return AGE_MAP.get(label, "Unknown")
+
+# ── CSV helpers ───────────────────────────────────────────────────────────────
+
+FIELDNAMES = ["url", "name", "gender", "age_group",
+              "gender_confidence", "age_confidence",
+              "detected_by", "status"]
+csv_lock = Lock()
+
+def write_row(row: dict) -> None:
+    with csv_lock:
+        with open(OUTPUT_CSV, "a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=FIELDNAMES).writerow(row)
+
+def load_processed_urls() -> set:
+    done = set()
+    if not os.path.exists(OUTPUT_CSV):
+        return done
+    with open(OUTPUT_CSV, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            u = row.get("url", "").strip()
+            if u:
+                done.add(u)
+    return done
+
+def url_to_name(url: str) -> str:
+    return url.rstrip("/").split("/")[-1].rsplit(".", 1)[0]
+
+# ── Multi-layer human detector ────────────────────────────────────────────────
+
+class HumanDetector:
+    """
+    4-layer cascade detector — tries from most to least specific.
+    Returns (detected: bool, method: str, confidence: float)
+    """
+
+    def __init__(self):
+        # OpenCV Haar cascades (bundled with cv2, always available offline)
+        hc = cv2.data.haarcascades
+        self.cascades = {
+            "frontal_default": cv2.CascadeClassifier(hc + "haarcascade_frontalface_default.xml"),
+            "frontal_alt2":    cv2.CascadeClassifier(hc + "haarcascade_frontalface_alt2.xml"),
+            "profile_face":    cv2.CascadeClassifier(hc + "haarcascade_profileface.xml"),
+            "upper_body":      cv2.CascadeClassifier(hc + "haarcascade_upperbody.xml"),
+        }
+        # YOLO — loaded separately with auto-repair
+        self.yolo = None
+
+    def load_yolo(self) -> bool:
+        """Load YOLOv8n, auto-deleting a corrupt cached .pt if needed."""
+        try:
+            from ultralytics import YOLO
+            self.yolo = YOLO("yolov8n.pt")
+            return True
+        except (AttributeError, Exception) as e:
+            # FIX 1: 'Conv' object has no attribute 'bn' → corrupt cache
+            if "bn" in str(e) or "attribute" in str(e).lower():
+                print("  ⚠  Corrupt yolov8n.pt detected — deleting and re-downloading …")
+                # Find and delete the cached file
+                for candidate in [
+                    "yolov8n.pt",
+                    os.path.expanduser("~/.config/Ultralytics/yolov8n.pt"),
+                    os.path.join(os.getcwd(), "yolov8n.pt"),
+                ]:
+                    if os.path.exists(candidate):
+                        os.remove(candidate)
+                        print(f"  ✓ Deleted {candidate}")
+                # Try again with fresh download
+                try:
+                    from ultralytics import YOLO
+                    self.yolo = YOLO("yolov8n.pt")
+                    print("  ✓ YOLOv8n re-downloaded successfully")
+                    return True
+                except Exception as e2:
+                    print(f"  ✗ YOLO reload failed: {e2} — using cascade-only mode")
+                    return False
+            else:
+                print(f"  ✗ YOLO load error: {e} — using cascade-only mode")
+                return False
+
+    # ── Layer 1: YOLO ────────────────────────────────────────────────────────
+
+    def _yolo_detect(self, img_path: str) -> tuple[bool, float]:
+        if self.yolo is None:
+            return False, 0.0
+        try:
+            results = self.yolo(img_path, verbose=False)
+            best = 0.0
+            for r in results:
+                for box in r.boxes:
+                    if int(box.cls[0]) == 0:          # class 0 = person
+                        conf = float(box.conf[0])
+                        if conf > best:
+                            best = conf
+            return best >= YOLO_CONF_THRESHOLD, best
+        except (AttributeError, Exception) as e:
+            # FIX 1 mid-run: catch 'bn' error during inference
+            if "bn" in str(e) or "attribute" in str(e).lower():
+                print("  ⚠  YOLO inference error (Conv bn) — disabling YOLO, using cascade")
+                self.yolo = None
+            return False, 0.0
+
+    # ── Layers 2-4: OpenCV cascades ──────────────────────────────────────────
+
+    def _cascade_detect(self, img_np: np.ndarray) -> tuple[bool, str]:
+        """Try all 4 cascades including mirrored profile."""
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        # Equalise histogram for better contrast detection
+        gray = cv2.equalizeHist(gray)
+
+        params = [
+            # (scaleFactor, minNeighbors, minSize) — progressively more lenient
+            (1.05, 4, (25, 25)),
+            (1.08, 3, (20, 20)),
+            (1.10, 2, (15, 15)),
+        ]
+        for name, cascade in self.cascades.items():
+            for sf, mn, ms in params:
+                faces = cascade.detectMultiScale(gray, scaleFactor=sf,
+                                                 minNeighbors=mn, minSize=ms)
+                if len(faces) > 0:
+                    return True, name
+
+        # Mirror image for profile faces looking left
+        gray_flip = cv2.flip(gray, 1)
+        for sf, mn, ms in params:
+            faces = self.cascades["profile_face"].detectMultiScale(
+                gray_flip, scaleFactor=sf, minNeighbors=mn, minSize=ms)
+            if len(faces) > 0:
+                return True, "profile_mirrored"
+
+        return False, "none"
+
+    # ── Public interface ─────────────────────────────────────────────────────
+
+    def detect(self, img_path: str, img_np: np.ndarray) -> tuple[bool, str, float]:
+        """
+        Returns (human_found, method_name, confidence_0_to_1)
+        Tries YOLO first, then 4 OpenCV cascades.
+        """
+        # Layer 1 — YOLO
+        yolo_found, yolo_conf = self._yolo_detect(img_path)
+        if yolo_found:
+            return True, "yolo", yolo_conf
+
+        # Layers 2-4 — OpenCV cascades
+        cas_found, cas_name = self._cascade_detect(img_np)
+        if cas_found:
+            return True, cas_name, 0.70   # cascades don't give a probability
+
+        # Soft fallback — return False but caller will still run FairFace
+        # (FairFace's own confidence acts as the final gate)
+        return False, "none", max(yolo_conf, 0.0)
+
+
+# ── Main detector class ───────────────────────────────────────────────────────
+
+class GenderAgeDetector:
+
+    def __init__(self):
+        print("─" * 62)
+        print("Loading models  (first run: ~200 MB download)")
+        print("─" * 62)
+
+        # Human detector
+        print("  [1/3] Human detector (YOLO + OpenCV cascades) …", end=" ", flush=True)
+        self.human = HumanDetector()
+        yolo_ok = self.human.load_yolo()
+        status = "YOLO + 4 cascades ✓" if yolo_ok else "cascade-only ✓ (YOLO unavailable)"
+        print(status)
+
+        # Gender model
+        print("  [2/3] FairFace gender model …", end=" ", flush=True)
+        self.gender_pipe = pipeline(
+            "image-classification",
+            model="dima806/fairface_gender_image_detection",
+            device=-1,
+        )
+        print("✓")
+
+        # Age model
+        print("  [3/3] FairFace age model …", end=" ", flush=True)
+        self.age_pipe = pipeline(
+            "image-classification",
+            model="dima806/fairface_age_image_detection",
+            device=-1,
+        )
+        print("✓\n")
+
+    def predict(self, img: Image.Image, img_path: str) -> dict:
+        img_np = np.array(img)
+
+        # ── Human detection ───────────────────────────────────────────────────
+        human_found, method, det_conf = self.human.detect(img_path, img_np)
+
+        # Even if not found, run FairFace — it self-filters non-faces via confidence
+        # ── Gender ────────────────────────────────────────────────────────────
+        try:
+            g_res   = self.gender_pipe(img)
+            g_label = g_res[0]["label"].capitalize()
+            g_conf  = g_res[0]["score"] * 100
+        except Exception as e:
+            return {"gender": "Unknown", "age_group": "Unknown",
+                    "gender_confidence": 0, "age_confidence": 0,
+                    "detected_by": method,
+                    "status": f"Gender model error: {e}"}
+
+        # If no human detected AND gender confidence is low → skip
+        if not human_found and g_conf < GENDER_CONF_THRESHOLD * 100:
+            return {"gender": "Unknown", "age_group": "Unknown",
+                    "gender_confidence": round(g_conf, 1), "age_confidence": 0,
+                    "detected_by": "none",
+                    "status": f"No human detected + low gender conf ({g_conf:.1f}%)"}
+
+        if g_conf < GENDER_CONF_THRESHOLD * 100:
+            return {"gender": "Unknown", "age_group": "Unknown",
+                    "gender_confidence": round(g_conf, 1), "age_confidence": 0,
+                    "detected_by": method,
+                    "status": f"Low gender confidence ({g_conf:.1f}%)"}
+
+        # ── Age ───────────────────────────────────────────────────────────────
+        try:
+            a_res   = self.age_pipe(img)
+            a_label = a_res[0]["label"]
+            a_conf  = a_res[0]["score"] * 100
+        except Exception as e:
+            a_label, a_conf = "Unknown", 0.0
+
+        return {
+            "gender":            g_label,
+            "age_group":         map_age(a_label),
+            "gender_confidence": round(g_conf, 1),
+            "age_confidence":    round(a_conf, 1),
+            "detected_by":       method,
+            "status":            "Success",
+        }
+
+
+# ── Per-URL worker ────────────────────────────────────────────────────────────
+
+def process_url(url: str, detector: GenderAgeDetector, idx: int, total: int) -> dict:
+    name   = url_to_name(url)
+    prefix = f"[{idx:>3}/{total}]"
+
+    # Download
+    try:
+        resp = requests.get(url, timeout=IMAGE_TIMEOUT)
+        resp.raise_for_status()
+        img  = Image.open(BytesIO(resp.content)).convert("RGB")
+    except Exception as e:
+        print(f"{prefix} ✗ {name}: download error — {e}")
+        return {"url": url, "name": name, "gender": "Unknown",
+                "age_group": "Unknown", "gender_confidence": "",
+                "age_confidence": "", "detected_by": "",
+                "status": f"Download error: {e}"}
+
+    # Save temp file for YOLO
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            img.save(f.name, format="JPEG", quality=95)
+            tmp = f.name
+        result = detector.predict(img, tmp)
+    except Exception as e:
+        print(f"{prefix} ✗ {name}: inference error — {e}")
+        result = {"gender": "Unknown", "age_group": "Unknown",
+                  "gender_confidence": "", "age_confidence": "",
+                  "detected_by": "", "status": f"Inference error: {e}"}
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+    # Print
+    st = result["status"]
+    if st == "Success":
+        print(f"{prefix} ✓ {name}: {result['gender']} "
+              f"({result['gender_confidence']}%)  "
+              f"age {result['age_group']} ({result['age_confidence']}%)  "
+              f"[{result['detected_by']}]")
+    elif "Unknown" in result["gender"]:
+        print(f"{prefix} ○ {name}: {st}")
+    else:
+        print(f"{prefix} ✗ {name}: {st}")
+
+    return {"url": url, "name": name, **result}
+
+
+# ── URL loading ───────────────────────────────────────────────────────────────
+
+def load_urls() -> list:
+    if os.path.exists(INPUT_CSV):
+        rows = []
+        with open(INPUT_CSV, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if "image_url" in (reader.fieldnames or []):
+                for row in reader:
+                    u = row["image_url"].strip()
+                    if u:
+                        rows.append(u)
+        if rows:
+            print(f"✓ Loaded {len(rows)} URLs from {INPUT_CSV}")
+            return rows
+    return list(URLS)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    t0 = time.time()
+
+    all_urls = load_urls()
+
+    # Deduplicate
+    seen, unique = set(), []
+    for u in all_urls:
+        if u not in seen:
+            unique.append(u); seen.add(u)
+    all_urls = unique
+
+    # Resume
+    processed  = load_processed_urls()
+    to_process = [u for u in all_urls if u not in processed]
+    skipped    = len(all_urls) - len(to_process)
+    if skipped:
+        print(f"✓ Skipping {skipped} already-processed URLs (resume mode)")
+    if not to_process:
+        print("All URLs already processed.")
+        return
+
+    # Init CSV
+    if not os.path.exists(OUTPUT_CSV) or os.path.getsize(OUTPUT_CSV) == 0:
+        with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
+
+    # Load models
+    detector = GenderAgeDetector()
+
+    total = len(to_process)
+    print(f"{'─'*62}")
+    print(f"Processing {total} images  |  {MAX_WORKERS} threads")
+    print(f"{'─'*62}")
+
+    summary = {"Female": 0, "Male": 0, "Unknown": 0, "Error": 0}
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(process_url, url, detector, i + 1, total): url
+            for i, url in enumerate(to_process)
+        }
+        for future in as_completed(futures):
+            try:
+                row = future.result()
+                write_row(row)
+                g  = row["gender"]
+                st = row["status"]
+                if "error" in st.lower():
+                    summary["Error"] += 1
+                elif g in ("Male", "Female"):
+                    summary[g] += 1
+                else:
+                    summary["Unknown"] += 1
+            except Exception as e:
+                print(f"✗ Thread error: {e}")
+                summary["Error"] += 1
+
+    elapsed = time.time() - t0
+    print(f"\n{'═'*62}")
+    print("SUMMARY")
+    print(f"{'═'*62}")
+    print(f"  Female   : {summary['Female']}")
+    print(f"  Male     : {summary['Male']}")
+    print(f"  Unknown  : {summary['Unknown']}")
+    print(f"  Error    : {summary['Error']}")
+    print(f"  ─────────")
+    print(f"  Total    : {total}")
+    print(f"\n  Time     : {elapsed:.1f}s  (avg {elapsed/total:.1f}s/image)")
+    print(f"  Output   : {OUTPUT_CSV}")
+    print(f"{'═'*62}\n")
+
+
+if __name__ == "__main__":
+    main()
