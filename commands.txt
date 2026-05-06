@@ -1,0 +1,12 @@
+# 1. Create venv
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+# 2. Install requirements
+pip install ultralytics transformers torch pillow requests
+pip install ultralytics transformers torch pillow requests
+
+# 3. Run (models auto-download on first run ~200 MB total)
+python G2local.py
+
+
